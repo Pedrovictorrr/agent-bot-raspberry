@@ -1,0 +1,17 @@
+{
+  "name": "psis-discord-agent",
+  "version": "1.0.0",
+  "description": "Discord bot + Claude agent for PSIS-SAAS",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "agent": "node agent.js",
+    "dev": "node bot.js & node agent.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "axios": "^1.7.0",
+    "discord.js": "^14.16.0",
+    "express": "^4.21.0"
+  }
+}
