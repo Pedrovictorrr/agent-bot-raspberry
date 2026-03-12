@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const https = require('https');
+const http = require('http');
 
 const app = express();
 app.use(express.json());
@@ -14,17 +15,38 @@ if (!DISCORD_WEBHOOK) {
   process.exit(1);
 }
 
+// Stores the last response from the bot
+let lastResponse = { text: 'Ainda não tenho nenhuma resposta.', timestamp: 0 };
+
+// Endpoint for the bot to send responses back
+app.post('/response', (req, res) => {
+  const { text } = req.body;
+  if (text) {
+    // Truncate for Alexa (max ~8000 chars speech, but keep it short)
+    lastResponse = {
+      text: text.length > 500 ? text.substring(0, 500) + '... resposta truncada.' : text,
+      timestamp: Date.now()
+    };
+    console.log(`[Alexa] Resposta recebida do bot (${text.length} chars)`);
+  }
+  res.json({ ok: true });
+});
+
 // Alexa sends POST requests to this endpoint
 app.post('/alexa', (req, res) => {
   const body = req.body;
 
   console.log(`[Alexa] Request type: ${body.request?.type}`);
 
-  // LaunchRequest — "Alexa, abrir Pedrinho"
+  if (!body.request) {
+    return res.json(buildResponse('Algo deu errado.', true));
+  }
+
+  // LaunchRequest — "Alexa, abrir Mango"
   if (body.request.type === 'LaunchRequest') {
     return res.json(buildResponse(
-      'Oi! Pode falar o que você quer que eu mande pro Pedrinho.',
-      false // keep session open
+      'Oi! Pode falar o que você quer que eu mande pro Pedrinho. Ou diga: qual foi a resposta.',
+      false
     ));
   }
 
@@ -40,7 +62,7 @@ app.post('/alexa', (req, res) => {
     // Help
     if (intentName === 'AMAZON.HelpIntent') {
       return res.json(buildResponse(
-        'Você pode me dizer qualquer comando e eu envio pro canal do Discord. Por exemplo: corrija o bug do login.',
+        'Você pode me dizer qualquer comando e eu envio pro canal do Discord. Depois diga: qual foi a resposta. Para ouvir o que o Pedrinho respondeu.',
         false
       ));
     }
@@ -48,6 +70,26 @@ app.post('/alexa', (req, res) => {
     // Stop/Cancel
     if (intentName === 'AMAZON.StopIntent' || intentName === 'AMAZON.CancelIntent') {
       return res.json(buildResponse('Até mais!', true));
+    }
+
+    // GetResponseIntent — "qual foi a resposta?"
+    if (intentName === 'GetResponseIntent') {
+      const age = Date.now() - lastResponse.timestamp;
+      const ageMinutes = Math.floor(age / 60000);
+
+      let speech;
+      if (lastResponse.timestamp === 0) {
+        speech = 'Ainda não tenho nenhuma resposta do Pedrinho.';
+      } else if (ageMinutes > 30) {
+        speech = `A última resposta foi há mais de ${ageMinutes} minutos. ${lastResponse.text}`;
+      } else {
+        speech = `Resposta do Pedrinho: ${lastResponse.text}`;
+      }
+
+      // Clean markdown for speech
+      speech = speech.replace(/[*_`#\[\]()]/g, '').replace(/\n+/g, '. ');
+
+      return res.json(buildResponse(speech, true));
     }
 
     // SendCommandIntent — the main one
@@ -69,8 +111,16 @@ app.post('/alexa', (req, res) => {
         .catch(err => console.error('[Alexa] Erro ao enviar:', err.message));
 
       return res.json(buildResponse(
-        `Pronto! Enviei pro Pedrinho: ${command}`,
+        `Enviei pro Pedrinho: ${command}. Quando ele responder, diga: qual foi a resposta.`,
         true
+      ));
+    }
+
+    // FallbackIntent
+    if (intentName === 'AMAZON.FallbackIntent') {
+      return res.json(buildResponse(
+        'Não entendi. Diga um comando para o Pedrinho ou pergunte: qual foi a resposta.',
+        false
       ));
     }
 

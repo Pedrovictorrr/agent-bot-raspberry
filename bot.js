@@ -7,6 +7,7 @@ const AGENT_URL = process.env.AGENT_URL || 'http://localhost:3001';
 const AGENT_SECRET = process.env.AGENT_SECRET || '';
 const CHANNEL_NAME = process.env.DISCORD_CHANNEL || 'deploy-logs';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const ALEXA_SKILL_PORT = process.env.ALEXA_SKILL_PORT || 3002;
 
 if (!DISCORD_TOKEN) {
   console.error('❌ DISCORD_TOKEN não configurado!');
@@ -54,12 +55,22 @@ async function handleWebhookMessage(message) {
 
   if (!content.trim()) return;
 
+  const isAlexa = content.includes('🎙️') || content.includes('Comando via Alexa');
+
   try {
     const reply = await callAgentSSE(content, true, message.channel, null);
     if (!reply || reply.trim() === '' || reply.trim() === 'ok') return;
     await sendLongMessage(message.channel, reply);
+
+    // If the message came from Alexa, send the response back
+    if (isAlexa && reply) {
+      notifyAlexa(reply);
+    }
   } catch (err) {
     console.error('Erro ao processar webhook:', err.message);
+    if (isAlexa) {
+      notifyAlexa(`Erro: ${err.message}`);
+    }
   }
 }
 
@@ -217,6 +228,24 @@ async function sendLongMessage(channel, text) {
   for (const chunk of chunks) {
     await channel.send(chunk);
   }
+}
+
+// Notify alexa-skill with the bot's response
+function notifyAlexa(text) {
+  const payload = JSON.stringify({ text });
+  const req = http.request({
+    hostname: 'localhost',
+    port: ALEXA_SKILL_PORT,
+    path: '/response',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    }
+  }, (res) => { res.resume(); });
+  req.on('error', (err) => console.error('[Bot] Erro ao notificar Alexa:', err.message));
+  req.write(payload);
+  req.end();
 }
 
 client.on('error', (err) => {
