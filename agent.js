@@ -166,7 +166,9 @@ ${auto ? `MODO AUTOMÁTICO:
 - Formate respostas com quebras de linha para Discord
 - Use ** para negrito e \` para código inline
 - Se o usuário mencionar um projeto pelo nome, troque para ele com switch_project
-- Quando listar projetos, mostre o status de cada um`}
+- Quando listar projetos, mostre o status de cada um
+- REGRA CRÍTICA: Se o usuário pedir qualquer tarefa (editar código, corrigir bug, criar feature, commitar, etc) e a mensagem NÃO mencionar claramente qual projeto (pelo nome, URL do repo, ou contexto óbvio), PARE e PERGUNTE: "Em qual projeto você quer que eu faça isso?" e liste os projetos disponíveis. NÃO assuma o projeto ativo automaticamente.
+- Exceções: se o usuário acabou de trocar de projeto ou mencionou o nome do projeto na mesma mensagem, pode prosseguir sem perguntar.`}
 
 ${context?.recentMessages ? `Mensagens recentes do canal:\n${context.recentMessages.map(m => `[${m.author}]: ${m.content}`).join('\n')}` : ''}
 
