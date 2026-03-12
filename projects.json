@@ -1,0 +1,8 @@
+{
+  "psiserp": {
+    "path": "/home/pi/projects/psiserp",
+    "repo": "CodeWave-Systems/PSIS-SAAS",
+    "branch": "ai-fixes",
+    "description": "ERP para clínicas de psicologia"
+  }
+}

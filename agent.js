@@ -11,10 +11,24 @@ app.use(express.json({ limit: '10mb' }));
 
 const anthropic = new Anthropic();
 
-const REPO_PATH = process.env.REPO_PATH || '/home/pi/psis-saas';
-const BRANCH = process.env.BRANCH || 'ai-fixes';
 const AGENT_SECRET = process.env.AGENT_SECRET || '';
 const MAX_TOOL_ITERATIONS = 25;
+const PROJECTS_DIR = process.env.PROJECTS_DIR || '/home/pi/projects';
+
+// Projects config — loaded from projects.json
+let projects = {};
+const projectsFile = path.join(__dirname, 'projects.json');
+
+function loadProjects() {
+  if (fs.existsSync(projectsFile)) {
+    projects = JSON.parse(fs.readFileSync(projectsFile, 'utf8'));
+  }
+  console.log(`📋 ${Object.keys(projects).length} projetos carregados:`, Object.keys(projects).join(', '));
+}
+loadProjects();
+
+// Current active project per session
+let activeProject = Object.keys(projects)[0] || null;
 
 // Auth middleware
 app.use((req, res, next) => {
@@ -26,16 +40,59 @@ app.use((req, res, next) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  const gitStatus = safeExec(`cd ${REPO_PATH} && git status --short`);
-  const branch = safeExec(`cd ${REPO_PATH} && git branch --show-current`);
-  res.json({ status: 'ok', branch: branch.trim(), changes: gitStatus.trim() || 'clean' });
+  const status = {};
+  for (const [name, config] of Object.entries(projects)) {
+    const repoPath = config.path;
+    if (fs.existsSync(repoPath)) {
+      const branch = safeExec(`cd ${repoPath} && git branch --show-current`).trim();
+      const changes = safeExec(`cd ${repoPath} && git status --short`).trim();
+      status[name] = { branch, changes: changes || 'clean', path: repoPath };
+    } else {
+      status[name] = { error: 'repo not found', path: repoPath };
+    }
+  }
+  res.json({ activeProject, projects: status });
+});
+
+// List projects
+app.get('/projects', (req, res) => {
+  res.json({ activeProject, projects });
+});
+
+// Clone a new project
+app.post('/projects/clone', async (req, res) => {
+  const { name, repo, branch } = req.body;
+  if (!name || !repo) return res.status(400).json({ error: 'name and repo required' });
+
+  const repoPath = path.join(PROJECTS_DIR, name);
+  try {
+    if (!fs.existsSync(PROJECTS_DIR)) fs.mkdirSync(PROJECTS_DIR, { recursive: true });
+    const output = safeExec(`cd ${PROJECTS_DIR} && gh repo clone ${repo} ${name} 2>&1`, 120000);
+
+    if (branch && branch !== 'main') {
+      safeExec(`cd ${repoPath} && git checkout -b ${branch} 2>&1`, 10000);
+      safeExec(`cd ${repoPath} && git push -u origin ${branch} 2>&1`, 30000);
+    }
+
+    projects[name] = {
+      path: repoPath,
+      repo,
+      branch: branch || 'main',
+      description: ''
+    };
+    fs.writeFileSync(projectsFile, JSON.stringify(projects, null, 2));
+    activeProject = name;
+
+    res.json({ success: true, output, project: projects[name] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Main chat endpoint with SSE progress
 app.post('/chat', async (req, res) => {
   const { message, auto, context } = req.body;
 
-  // Set up SSE for progress updates
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -59,19 +116,41 @@ app.post('/chat', async (req, res) => {
   try {
     sendProgress('Analisando o pedido...');
 
-    const gitLog = safeExec(`cd ${REPO_PATH} && git log --oneline -10`);
-    const gitStatus = safeExec(`cd ${REPO_PATH} && git status --short`);
-    const currentBranch = safeExec(`cd ${REPO_PATH} && git branch --show-current`);
+    // Build project list for Claude
+    const projectList = Object.entries(projects).map(([name, config]) => {
+      const repoPath = config.path;
+      const branch = fs.existsSync(repoPath)
+        ? safeExec(`cd ${repoPath} && git branch --show-current`).trim()
+        : '(não clonado)';
+      return `- **${name}**: ${config.repo} (branch: ${branch}) ${config.description ? '— ' + config.description : ''}`;
+    }).join('\n');
 
-    const systemPrompt = `Você é o Pedrinho, um agente de desenvolvimento trabalhando no repositório Laravel PSIS-SAAS em ${REPO_PATH}.
-Branch atual: ${currentBranch.trim()}
-Branch de trabalho: ${BRANCH}
+    // Get active project info
+    const proj = projects[activeProject];
+    const repoPath = proj?.path || PROJECTS_DIR;
+    let gitLog = '', gitStatus = '', currentBranch = '';
+
+    if (proj && fs.existsSync(repoPath)) {
+      gitLog = safeExec(`cd ${repoPath} && git log --oneline -10`);
+      gitStatus = safeExec(`cd ${repoPath} && git status --short`);
+      currentBranch = safeExec(`cd ${repoPath} && git branch --show-current`).trim();
+    }
+
+    const systemPrompt = `Você é o Pedrinho, um agente de desenvolvimento com acesso a múltiplos projetos.
+
+## Projetos disponíveis:
+${projectList}
+
+## Projeto ativo: **${activeProject || 'nenhum'}**
+${proj ? `Caminho: ${repoPath}
+Branch: ${currentBranch}
+Branch de deploy: ${proj.branch}
 
 Git status:
 ${gitStatus || '(limpo)'}
 
 Últimos commits:
-${gitLog}
+${gitLog}` : 'Nenhum projeto ativo. Use switch_project para selecionar.'}
 
 ${auto ? `MODO AUTOMÁTICO:
 - Um webhook de deploy ou exception chegou no Discord
@@ -83,10 +162,11 @@ ${auto ? `MODO AUTOMÁTICO:
 - Responda normalmente ao usuário
 - Execute tarefas, leia/edite arquivos, faça commits
 - Use mensagens de commit descritivas em português
-- O auto-deploy vai rodar após o push para a branch ${BRANCH}
 - IMPORTANTE: Ao terminar, SEMPRE dê um resumo final claro
 - Formate respostas com quebras de linha para Discord
-- Use ** para negrito e \` para código inline`}
+- Use ** para negrito e \` para código inline
+- Se o usuário mencionar um projeto pelo nome, troque para ele com switch_project
+- Quando listar projetos, mostre o status de cada um`}
 
 ${context?.recentMessages ? `Mensagens recentes do canal:\n${context.recentMessages.map(m => `[${m.author}]: ${m.content}`).join('\n')}` : ''}
 
@@ -94,8 +174,33 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
 
     const tools = [
       {
+        name: 'switch_project',
+        description: 'Troca o projeto ativo. Todas as operações de arquivo e git passam a ser nesse projeto.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            project: { type: 'string', description: 'Nome do projeto (ex: psiserp, hadescondo, petfolio)' }
+          },
+          required: ['project']
+        }
+      },
+      {
+        name: 'clone_project',
+        description: 'Clona um novo repositório do GitHub para o Pi',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Nome curto do projeto (usado como pasta)' },
+            repo: { type: 'string', description: 'Repositório GitHub (ex: Pedrovictorrr/meu-repo ou org/repo)' },
+            branch: { type: 'string', description: 'Branch de trabalho (padrão: main)' },
+            description: { type: 'string', description: 'Descrição curta do projeto' }
+          },
+          required: ['name', 'repo']
+        }
+      },
+      {
         name: 'read_file',
-        description: 'Lê o conteúdo de um arquivo do projeto',
+        description: 'Lê o conteúdo de um arquivo do projeto ativo',
         input_schema: {
           type: 'object',
           properties: {
@@ -106,7 +211,7 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
       },
       {
         name: 'write_file',
-        description: 'Escreve/modifica um arquivo do projeto',
+        description: 'Escreve/modifica um arquivo do projeto ativo',
         input_schema: {
           type: 'object',
           properties: {
@@ -117,8 +222,21 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
         }
       },
       {
+        name: 'edit_file',
+        description: 'Substitui um trecho de texto em um arquivo (search & replace)',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Caminho relativo ao root do projeto' },
+            old_text: { type: 'string', description: 'Texto exato a ser substituído' },
+            new_text: { type: 'string', description: 'Texto novo que vai substituir' }
+          },
+          required: ['path', 'old_text', 'new_text']
+        }
+      },
+      {
         name: 'run_command',
-        description: 'Executa qualquer comando shell no diretório do projeto (git, php, sed, grep, cat, npm, etc)',
+        description: 'Executa qualquer comando shell no diretório do projeto ativo',
         input_schema: {
           type: 'object',
           properties: {
@@ -129,7 +247,7 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
       },
       {
         name: 'search_code',
-        description: 'Busca por padrão no código (grep recursivo)',
+        description: 'Busca por padrão no código do projeto ativo',
         input_schema: {
           type: 'object',
           properties: {
@@ -141,26 +259,13 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
       },
       {
         name: 'list_files',
-        description: 'Lista arquivos em um diretório do projeto',
+        description: 'Lista arquivos em um diretório do projeto ativo',
         input_schema: {
           type: 'object',
           properties: {
             path: { type: 'string', description: 'Caminho relativo ao root (padrão: root)' }
           },
           required: []
-        }
-      },
-      {
-        name: 'edit_file',
-        description: 'Substitui um trecho de texto em um arquivo (search & replace). Mais seguro que write_file para edições parciais.',
-        input_schema: {
-          type: 'object',
-          properties: {
-            path: { type: 'string', description: 'Caminho relativo ao root do projeto' },
-            old_text: { type: 'string', description: 'Texto exato a ser substituído' },
-            new_text: { type: 'string', description: 'Texto novo que vai substituir' }
-          },
-          required: ['path', 'old_text', 'new_text']
         }
       }
     ];
@@ -172,7 +277,7 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
 
     while (iterations < MAX_TOOL_ITERATIONS) {
       iterations++;
-      console.log(`[Loop ${iterations}/${MAX_TOOL_ITERATIONS}]`);
+      console.log(`[${activeProject}] [Loop ${iterations}/${MAX_TOOL_ITERATIONS}]`);
 
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
@@ -189,12 +294,10 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
         lastTextReply = textBlocks.map(b => b.text).join('\n');
       }
 
-      // Se não tem tool calls, é a resposta final
       if (toolUses.length === 0 || response.stop_reason === 'end_turn') {
         break;
       }
 
-      // Process tool calls with progress
       const toolResults = [];
       for (const toolUse of toolUses) {
         const toolDesc = getToolDescription(toolUse.name, toolUse.input);
@@ -214,7 +317,6 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
       lastTextReply = '';
     }
 
-    // Se terminou sem texto final, pede um resumo
     if (!lastTextReply) {
       sendProgress('Gerando resumo...');
       const summaryResponse = await anthropic.messages.create({
@@ -230,7 +332,7 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
       lastTextReply = summaryText.map(b => b.text).join('\n');
     }
 
-    console.log(`[Done] ${iterations} iterações`);
+    console.log(`[${activeProject}] [Done] ${iterations} iterações`);
     sendReply(lastTextReply.trim() || '(sem resposta)');
   } catch (err) {
     console.error('Agent error:', err);
@@ -240,9 +342,11 @@ IMPORTANTE: Sempre responda em português brasileiro.`;
 
 function getToolDescription(name, input) {
   switch (name) {
-    case 'read_file': return `Lendo arquivo: \`${input.path}\``;
-    case 'write_file': return `Escrevendo arquivo: \`${input.path}\``;
-    case 'edit_file': return `Editando arquivo: \`${input.path}\``;
+    case 'switch_project': return `Trocando para projeto: **${input.project}**`;
+    case 'clone_project': return `Clonando projeto: **${input.name}** de ${input.repo}`;
+    case 'read_file': return `Lendo: \`${input.path}\``;
+    case 'write_file': return `Escrevendo: \`${input.path}\``;
+    case 'edit_file': return `Editando: \`${input.path}\``;
     case 'run_command': return `Executando: \`${input.command.slice(0, 80)}\``;
     case 'search_code': return `Buscando: \`${input.pattern}\``;
     case 'list_files': return `Listando: \`${input.path || '/'}\``;
@@ -250,20 +354,73 @@ function getToolDescription(name, input) {
   }
 }
 
+function getActiveRepoPath() {
+  const proj = projects[activeProject];
+  return proj?.path || PROJECTS_DIR;
+}
+
 async function handleTool(name, input) {
   try {
+    // Project management tools
+    if (name === 'switch_project') {
+      const projectName = input.project.toLowerCase();
+      // Fuzzy match
+      const match = Object.keys(projects).find(k =>
+        k.toLowerCase() === projectName ||
+        k.toLowerCase().includes(projectName) ||
+        projectName.includes(k.toLowerCase())
+      );
+      if (!match) {
+        return `Projeto "${input.project}" não encontrado. Disponíveis: ${Object.keys(projects).join(', ')}`;
+      }
+      activeProject = match;
+      const proj = projects[match];
+      const branch = safeExec(`cd ${proj.path} && git branch --show-current`).trim();
+      return `Projeto ativo: **${match}** (${proj.repo}, branch: ${branch})`;
+    }
+
+    if (name === 'clone_project') {
+      const repoPath = path.join(PROJECTS_DIR, input.name);
+      if (fs.existsSync(repoPath)) {
+        return `Pasta ${input.name} já existe. Use switch_project para ativar.`;
+      }
+      if (!fs.existsSync(PROJECTS_DIR)) fs.mkdirSync(PROJECTS_DIR, { recursive: true });
+
+      const output = safeExec(`cd ${PROJECTS_DIR} && gh repo clone ${input.repo} ${input.name} 2>&1`, 120000);
+
+      const branch = input.branch || 'ai-fixes';
+      if (branch !== 'main') {
+        safeExec(`cd ${repoPath} && git checkout -b ${branch} 2>&1`, 10000);
+        safeExec(`cd ${repoPath} && git push -u origin ${branch} 2>&1`, 30000);
+      }
+
+      projects[input.name] = {
+        path: repoPath,
+        repo: input.repo,
+        branch,
+        description: input.description || ''
+      };
+      fs.writeFileSync(projectsFile, JSON.stringify(projects, null, 2));
+      activeProject = input.name;
+
+      return `Projeto "${input.name}" clonado com sucesso em ${repoPath} (branch: ${branch}).\n${output}`;
+    }
+
+    // File/code tools — use active project
+    const repoPath = getActiveRepoPath();
+
     switch (name) {
       case 'read_file': {
-        const fullPath = path.join(REPO_PATH, input.path);
-        if (!fullPath.startsWith(REPO_PATH)) return 'Acesso negado: caminho fora do projeto';
+        const fullPath = path.join(repoPath, input.path);
+        if (!fullPath.startsWith(repoPath)) return 'Acesso negado: caminho fora do projeto';
         if (!fs.existsSync(fullPath)) return `Arquivo não encontrado: ${input.path}`;
         const content = fs.readFileSync(fullPath, 'utf8');
         return content.length > 15000 ? content.slice(0, 15000) + '\n... (truncado)' : content;
       }
 
       case 'write_file': {
-        const fullPath = path.join(REPO_PATH, input.path);
-        if (!fullPath.startsWith(REPO_PATH)) return 'Acesso negado: caminho fora do projeto';
+        const fullPath = path.join(repoPath, input.path);
+        if (!fullPath.startsWith(repoPath)) return 'Acesso negado: caminho fora do projeto';
         const dir = path.dirname(fullPath);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(fullPath, input.content);
@@ -271,8 +428,8 @@ async function handleTool(name, input) {
       }
 
       case 'edit_file': {
-        const fullPath = path.join(REPO_PATH, input.path);
-        if (!fullPath.startsWith(REPO_PATH)) return 'Acesso negado: caminho fora do projeto';
+        const fullPath = path.join(repoPath, input.path);
+        if (!fullPath.startsWith(repoPath)) return 'Acesso negado: caminho fora do projeto';
         if (!fs.existsSync(fullPath)) return `Arquivo não encontrado: ${input.path}`;
         let content = fs.readFileSync(fullPath, 'utf8');
         if (!content.includes(input.old_text)) {
@@ -284,21 +441,20 @@ async function handleTool(name, input) {
       }
 
       case 'run_command': {
-        // Sem restrições - confia no Claude
-        return safeExec(`cd ${REPO_PATH} && ${input.command}`, 60000);
+        return safeExec(`cd ${repoPath} && ${input.command}`, 60000);
       }
 
       case 'search_code': {
-        const searchPath = input.path ? path.join(REPO_PATH, input.path) : REPO_PATH;
+        const searchPath = input.path ? path.join(repoPath, input.path) : repoPath;
         const result = safeExec(
-          `cd ${REPO_PATH} && grep -rn --include="*.php" --include="*.js" --include="*.vue" --include="*.blade.php" --include="*.css" --include="*.json" --include="*.ts" "${input.pattern}" ${searchPath} | head -50`,
+          `cd ${repoPath} && grep -rn --include="*.php" --include="*.js" --include="*.vue" --include="*.blade.php" --include="*.css" --include="*.json" --include="*.ts" "${input.pattern}" ${searchPath} | head -50`,
           15000
         );
         return result || 'Nenhum resultado encontrado.';
       }
 
       case 'list_files': {
-        const listPath = input.path ? path.join(REPO_PATH, input.path) : REPO_PATH;
+        const listPath = input.path ? path.join(repoPath, input.path) : repoPath;
         return safeExec(`find ${listPath} -maxdepth 2 -type f | head -80`);
       }
 
@@ -321,6 +477,7 @@ function safeExec(cmd, timeout = 15000) {
 const PORT = process.env.AGENT_PORT || 3001;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🤖 Claude Agent rodando na porta ${PORT}`);
-  console.log(`📁 Repo: ${REPO_PATH}`);
-  console.log(`🌿 Branch: ${BRANCH}`);
+  console.log(`📁 Projetos: ${PROJECTS_DIR}`);
+  console.log(`📋 Ativo: ${activeProject || 'nenhum'}`);
+  loadProjects();
 });
