@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const http = require('http');
 
 const AGENT_URL = process.env.AGENT_URL || 'http://localhost:3001';
@@ -40,6 +40,18 @@ client.on('messageCreate', async (message) => {
   await handleHumanMessage(message);
 });
 
+// Extract image URLs from message attachments
+function extractImages(message) {
+  const images = [];
+  for (const attachment of message.attachments.values()) {
+    const ct = attachment.contentType || '';
+    if (ct.startsWith('image/')) {
+      images.push({ url: attachment.url, mediaType: ct });
+    }
+  }
+  return images;
+}
+
 async function handleWebhookMessage(message) {
   let content = message.content || '';
   if (message.embeds.length > 0) {
@@ -56,10 +68,33 @@ async function handleWebhookMessage(message) {
   if (!content.trim()) return;
 
   const isAlexa = content.includes('🎙️') || content.includes('Comando via Alexa');
+  const isException = content.includes('Exception') || content.includes('Error') || content.includes('❌') || content.includes('🔴');
+
+  // Show status for exceptions
+  let statusMsg = null;
+  if (isException) {
+    statusMsg = await message.channel.send('🔍 **Analisando exception...**');
+  }
 
   try {
-    const reply = await callAgentSSE(content, true, message.channel, null);
-    if (!reply || reply.trim() === '' || reply.trim() === 'ok') return;
+    let stepCount = 0;
+    const reply = await callAgentSSE(content, true, message.channel, isException ? async (step, sessionId) => {
+      stepCount++;
+      try {
+        if (statusMsg) {
+          await statusMsg.edit(`🔧 **Etapa ${stepCount}:** ${step}`);
+        }
+      } catch (e) {}
+    } : null);
+
+    if (!reply || reply.trim() === '' || reply.trim() === 'ok') {
+      if (statusMsg) await statusMsg.delete().catch(() => {});
+      return;
+    }
+
+    if (statusMsg) {
+      await statusMsg.edit(`✅ Análise concluída em ${stepCount} etapas.`);
+    }
     await sendLongMessage(message.channel, reply);
 
     // If the message came from Alexa, send the response back
@@ -68,6 +103,7 @@ async function handleWebhookMessage(message) {
     }
   } catch (err) {
     console.error('Erro ao processar webhook:', err.message);
+    if (statusMsg) await statusMsg.edit(`❌ Erro: ${err.message}`).catch(() => {});
     if (isAlexa) {
       notifyAlexa(`Erro: ${err.message}`);
     }
@@ -75,42 +111,92 @@ async function handleWebhookMessage(message) {
 }
 
 async function handleHumanMessage(message) {
-  const statusMsg = await message.reply('⏳ Pensando...');
+  const cancelBtn = new ButtonBuilder()
+    .setCustomId('cancel_task')
+    .setLabel('Cancelar')
+    .setStyle(ButtonStyle.Danger)
+    .setEmoji('⛔');
+
+  const row = new ActionRowBuilder().addComponents(cancelBtn);
+
+  const statusMsg = await message.reply({ content: '⏳ Pensando...', components: [row] });
   let stepCount = 0;
+  let currentSessionId = null;
+  let cancelled = false;
+
+  // Listen for button click
+  const collector = statusMsg.createMessageComponentCollector({ time: 600000 });
+  collector.on('collect', async (interaction) => {
+    if (interaction.customId === 'cancel_task') {
+      cancelled = true;
+      await interaction.update({ content: '⛔ Cancelando...', components: [] });
+      // Call agent abort endpoint
+      abortAgent(currentSessionId);
+    }
+  });
 
   try {
     const recentMessages = await getRecentMessages(message.channel);
+    const images = extractImages(message);
     const reply = await callAgentSSE(
       message.content,
       false,
       message.channel,
-      async (step) => {
+      async (step, sessionId) => {
+        if (cancelled) return;
         stepCount++;
+        currentSessionId = sessionId;
         try {
-          await statusMsg.edit(`🔧 **Etapa ${stepCount}:** ${step}`);
+          await statusMsg.edit({ content: `🔧 **Etapa ${stepCount}:** ${step}`, components: [row] });
         } catch (e) {
           console.error('Erro ao atualizar status:', e.message);
         }
       },
-      recentMessages
+      recentMessages,
+      images
     );
 
+    collector.stop();
     const finalReply = reply || '(sem resposta)';
 
-    // Envia resposta final como NOVA mensagem
-    await statusMsg.edit(`✅ Concluído em ${stepCount} etapas.`);
+    if (cancelled) {
+      await statusMsg.edit({ content: `⛔ Cancelado após ${stepCount} etapas.`, components: [] });
+    } else {
+      await statusMsg.edit({ content: `✅ Concluído em ${stepCount} etapas.`, components: [] });
+    }
     await sendLongMessage(message.channel, finalReply);
   } catch (err) {
+    collector.stop();
     console.error('Erro ao processar mensagem:', err.message);
-    await statusMsg.edit(`❌ Erro: ${err.message}`);
+    await statusMsg.edit({ content: `❌ Erro: ${err.message}`, components: [] });
   }
 }
 
-function callAgentSSE(message, auto, channel, onProgress, recentMessages) {
+function abortAgent(sessionId) {
+  const payload = JSON.stringify({ sessionId });
+  const url = new URL(AGENT_URL);
+  const req = http.request({
+    hostname: url.hostname,
+    port: url.port || 3001,
+    path: '/abort',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+      ...(AGENT_SECRET ? { Authorization: `Bearer ${AGENT_SECRET}` } : {})
+    }
+  }, (res) => { res.resume(); });
+  req.on('error', (err) => console.error('[Bot] Erro ao abortar:', err.message));
+  req.write(payload);
+  req.end();
+}
+
+function callAgentSSE(message, auto, channel, onProgress, recentMessages, images) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify({
       message,
       auto,
+      images: images || [],
       context: { recentMessages: recentMessages || [] }
     });
 
@@ -140,7 +226,7 @@ function callAgentSSE(message, auto, channel, onProgress, recentMessages) {
           try {
             const data = JSON.parse(line.slice(6));
             if (data.type === 'progress' && onProgress) {
-              onProgress(data.step);
+              onProgress(data.step, data.sessionId);
             } else if (data.type === 'reply') {
               resolve(data.reply);
             } else if (data.type === 'error') {
